@@ -1594,6 +1594,17 @@ document.getElementById('btnDeletePerf').onclick = async ()=>{
 
 /* ---------- MULTIPLAYER ---------- */
 let mpState = null;
+/* servidores STUN/TURN: el STUN solo no basta en varias redes móviles/corporativas.
+   El TURN de Open Relay Project es público y gratuito, se usa como respaldo cuando
+   la conexión directa no se puede establecer. */
+const MP_ICE_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username:'openrelayproject', credential:'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username:'openrelayproject', credential:'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username:'openrelayproject', credential:'openrelayproject' }
+  ]
+};
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 function randCode(){ let s=''; for(let i=0;i<4;i++) s+=CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]; return s; }
 function roomId(code){ return 'cabina-doblaje-'+code; }
@@ -1672,7 +1683,7 @@ async function mpCreateRoom(){
   const name = document.getElementById('mpHostName').value.trim() || 'Anfitrión';
   const code = randCode();
   mpStatus('Creando sala…');
-  const peer = new Peer(roomId(code));
+  const peer = new Peer(roomId(code), {config: MP_ICE_CONFIG});
   mpState = {role:'host', peer, code, myName:name, conns:[], clip:null, hostPool:[], votes:{}, chatLog:[]};
   peer.on('open', ()=>{ mpHostRenderLobby(); });
   peer.on('error', e=> mpStatus('Error: '+ (e.message||e.type)+'. Prueba crear la sala de nuevo.'));
@@ -1879,7 +1890,7 @@ function mpJoinRoom(){
   const name = document.getElementById('mpJoinName').value.trim() || 'Jugador';
   if(!code){ mpStatus('Escribe el código de la sala.'); return; }
   mpStatus('Conectando…');
-  const peer = new Peer();
+  const peer = new Peer(undefined, {config: MP_ICE_CONFIG});
   mpState = {role:'guest', peer, myName:name, clip:null, chatLog:[]};
   peer.on('open', ()=>{
     const conn = peer.connect(roomId(code), {reliable:true});
@@ -2039,11 +2050,54 @@ async function mpOnMyComplete(perf, isHost){
     mpHostRenderWaiting();
   } else {
     const el = document.getElementById('mpBody');
-    el.innerHTML = `<h2>Enviando tu toma…</h2><p class="hint" id="mpStatus">Preparando el audio…</p>`;
+    mpRenderSendingScreen(perf);
+  }
+}
+
+function mpRenderSendingScreen(perf){
+  const el = document.getElementById('mpBody');
+  el.innerHTML = `<h2>Enviando tu toma…</h2><p class="hint" id="mpStatus">Preparando el audio…</p>
+    <p class="hint" id="mpSendTimer" style="font-family:'JetBrains Mono',monospace;"></p>
+    <div id="mpSendRetryBox"></div>`;
+  mpTrySendSubmit(perf);
+}
+
+async function mpTrySendSubmit(perf){
+  const startedAt = Date.now();
+  let done = false;
+  const timerInt = setInterval(()=>{
+    const t = document.getElementById('mpSendTimer');
+    if(t) t.textContent = `${Math.round((Date.now()-startedAt)/1000)}s`;
+  }, 500);
+
+  // aviso de "esto está tardando" si en 12s no ha terminado, sin cancelar el envío real
+  const stallTimer = setTimeout(()=>{
+    if(done) return;
+    const box = document.getElementById('mpSendRetryBox');
+    if(box) box.innerHTML = `<p class="hint">Esto está tardando más de lo normal — puede ser la conexión con el anfitrión.</p>
+      <button class="btn btn-amber" id="mpBtnRetrySend">Reintentar envío</button>`;
+    const btn = document.getElementById('mpBtnRetrySend');
+    if(btn) btn.onclick = ()=>{ mpRenderSendingScreen(perf); };
+  }, 12000);
+
+  try{
+    if(!mpState.conn || mpState.conn.open === false){
+      throw new Error('la conexión con el anfitrión se cerró');
+    }
     await mpSendSubmit(perf);
+    done = true;
+    clearInterval(timerInt); clearTimeout(stallTimer);
+    const el = document.getElementById('mpBody');
     el.innerHTML = `<h2>¡Toma enviada!</h2><p class="hint">Esperando a que el resto termine…</p>${chatBoxHTML()}`;
     initChatBox();
-    mpStatus('');
+  }catch(err){
+    done = true;
+    clearInterval(timerInt); clearTimeout(stallTimer);
+    const box = document.getElementById('mpSendRetryBox');
+    if(box) box.innerHTML = `<p class="hint">No se pudo enviar: ${escapeHtml(err.message||String(err))}.</p>
+      <button class="btn btn-amber" id="mpBtnRetrySend">Reintentar envío</button>`;
+    const btn = document.getElementById('mpBtnRetrySend');
+    if(btn) btn.onclick = ()=>{ mpRenderSendingScreen(perf); };
   }
 }
 
@@ -2051,12 +2105,8 @@ async function mpSendSubmit(perf){
   const blobs = perf.fragments.map(f=>f.audioBlob);
   const {buffer, index} = await concatBlobsWithIndex(blobs);
   const fragMeta = perf.fragments.map((f,i)=>({start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm', offset:index[i].offset, length:index[i].length}));
-  try{
-    await sendChunked(mpState.conn, {t:'submit', name:mpState.myName, fragMeta}, buffer,
-      (done,total)=> mpStatus(`Enviando tu toma… ${Math.round(done/total*100)}%`));
-  }catch(e){
-    mpStatus('No se pudo enviar tu toma. Revisa tu conexión e inténtalo de nuevo desde "Multijugador".');
-  }
+  await sendChunked(mpState.conn, {t:'submit', name:mpState.myName, fragMeta}, buffer,
+    (doneChunks,total)=> mpStatus(`Enviando tu toma… ${Math.round(doneChunks/total*100)}%`));
 }
 
 /* --- voting --- */
