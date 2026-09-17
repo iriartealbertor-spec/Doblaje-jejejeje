@@ -796,8 +796,7 @@ function previewFragmentWithMusic(frag){
     }
   };
   vid.addEventListener('timeupdate', onTime);
-  if(Math.abs(vid.currentTime-frag.start)<0.05) go();
-  else vid.addEventListener('seeked', go, {once:true});
+  go();
 }
 document.getElementById('btnSaveClip').onclick = async ()=>{
   if(navigator.storage && navigator.storage.estimate){
@@ -1121,9 +1120,10 @@ function startRecording(){
     }, 60);
   };
 
-  // espera al seek para que audio y video arranquen juntos
-  if(Math.abs(vid.currentTime - frag.start) < 0.05) begin();
-  else vid.addEventListener('seeked', begin, {once:true});
+  // se arranca todo de inmediato, dentro del mismo gesto del toque/click del usuario:
+  // los navegadores móviles bloquean el audio con sonido si no arranca síncronamente
+  // en la respuesta al gesto, así que no se espera al evento 'seeked'.
+  begin();
 }
 
 async function showTakeReview(blob){
@@ -1365,8 +1365,7 @@ document.getElementById('btnPlayCompare').onclick = async ()=>{
       curAudio.play().catch(()=>{});
       if(cmpMusicEl){ try{ cmpMusicEl.currentTime = f.start; }catch(e){} cmpMusicEl.play().catch(()=>{}); }
     };
-    if(Math.abs(vid.currentTime - f.start) < 0.05) go();
-    else vid.addEventListener('seeked', go, {once:true});
+    go(); // se llama de inmediato: esperar a 'seeked' rompe el permiso de audio con sonido en móvil
     const onTime = ()=>{
       if(vid.currentTime >= f.end - 0.03){
         vid.pause();
@@ -1926,12 +1925,15 @@ async function mpStartRound(clip, isHost){
 }
 
 async function mpOnMyComplete(perf, isHost){
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('view-multi').classList.add('active');
+  const multiNav = document.querySelector('.nav-btn[data-view="multi"]');
+  if(multiNav) multiNav.classList.add('active');
   if(isHost){
     mpState.hostPool.push(perf);
     mpHostRenderWaiting();
   } else {
-    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
-    document.getElementById('view-multi').classList.add('active');
     const el = document.getElementById('mpBody');
     el.innerHTML = `<h2>¡Toma enviada!</h2><p class="hint">Esperando a que el resto termine…</p>${chatBoxHTML()}`;
     initChatBox();
@@ -2004,8 +2006,7 @@ function mpPlayPerf(clip, perf){
     mpCurAudio = new Audio(poolUrl('vote', f.audioBlob));
     const a = mpCurAudio;
     const go = ()=>{ vid.play().catch(()=>{}); if(f.leadTrim) a.currentTime = f.leadTrim; a.play().catch(()=>{}); };
-    if(Math.abs(vid.currentTime - f.start) < 0.05) go();
-    else vid.addEventListener('seeked', go, {once:true});
+    go(); // se llama de inmediato: esperar a 'seeked' rompe el permiso de audio con sonido en móvil
     const onTime = ()=>{
       if(vid.currentTime >= f.end - 0.03){
         vid.pause(); vid.removeEventListener('timeupdate', onTime); a.pause();
