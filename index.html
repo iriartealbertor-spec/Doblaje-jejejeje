@@ -1711,6 +1711,15 @@ async function mpHostRenderLobby(){
 
 const CHUNK_SIZE = 256*1024; // 256 KB por mensaje: estable en DataChannel
 
+// junta varios blobs de audio en un solo buffer, guardando dónde empieza y cuánto mide cada uno
+async function concatBlobsWithIndex(blobs){
+  let offset=0; const index=[];
+  blobs.forEach(b=>{ index.push({offset, length:b.size}); offset+=b.size; });
+  const combined = new Blob(blobs);
+  const buffer = await combined.arrayBuffer();
+  return {buffer, index};
+}
+
 // envía un ArrayBuffer grande en trozos, esperando a que se vacíe el buffer
 async function sendChunked(conn, meta, buffer, onProgress){
   const total = Math.ceil(buffer.byteLength/CHUNK_SIZE);
@@ -1780,11 +1789,30 @@ async function mpHostStartGame(){
 
 function mpHostHandle(conn, msg){
   if(msg.t==='hello'){ conn._name = msg.name || 'Jugador'; mpHostRenderLobby(); }
-  else if(msg.t==='submit'){
-    const perf = {id:uid(), clipId:mpState.clip.id, playerName: conn._name||msg.name, fragments: msg.fragments.map(f=>({start:f.start,end:f.end,text:f.text||'',leadTrim:f.leadTrim||0,audioBlob:bufToBlob(f.buf,f.mime)})), createdAt:Date.now()};
+  else if(msg.t==='submit-meta'){
+    conn._rxSubmit = {meta:msg, chunks:new Array(msg.totalChunks), got:0};
+    mpStatus(`Recibiendo la toma de ${escapeHtml(conn._name||'un jugador')}… 0%`);
+  }
+  else if(msg.t==='submit-chunk'){
+    const rx = conn._rxSubmit;
+    if(!rx) return;
+    rx.chunks[msg.i] = msg.buf; rx.got++;
+    if(rx.got % 8 === 0 || rx.got === rx.meta.totalChunks)
+      mpStatus(`Recibiendo la toma de ${escapeHtml(conn._name||'un jugador')}… ${Math.round(rx.got/rx.meta.totalChunks*100)}%`);
+  }
+  else if(msg.t==='submit-end'){
+    const rx = conn._rxSubmit;
+    if(!rx) return;
+    conn._rxSubmit = null;
+    if(rx.chunks.some(c=>!c)){ mpStatus(`Se perdió parte de la toma de ${escapeHtml(conn._name||'un jugador')}. Pídele que la reenvíe (puede rehacer y confirmar de nuevo).`); return; }
+    const fullBlob = new Blob(rx.chunks);
+    const perf = {id:uid(), clipId:mpState.clip.id, playerName: conn._name||rx.meta.name,
+      fragments: rx.meta.fragMeta.map(fm=>({start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')})),
+      createdAt:Date.now()};
     idbPut('performances', perf);
     mpState.hostPool.push(perf);
     conn._submitted = true;
+    mpStatus('');
     mpHostRenderWaiting();
   }
   else if(msg.t==='vote'){
@@ -1815,11 +1843,23 @@ function mpHostRenderWaiting(){
 }
 
 async function mpHostClosePoolAndVote(){
-  const payload = [];
+  mpStatus('Enviando las tomas a todos para votar…');
+  const blobs = []; const fragIndexMeta = [];
   for(const perf of mpState.hostPool){
-    payload.push({id:perf.id, playerName:perf.playerName, fragments: await Promise.all(perf.fragments.map(async f=>({start:f.start,end:f.end,text:f.text||'',leadTrim:f.leadTrim||0,buf:await blobToBuf(f.audioBlob),mime:f.audioBlob.type})))});
+    for(const f of perf.fragments){
+      blobs.push(f.audioBlob);
+      fragIndexMeta.push({perfId:perf.id, playerName:perf.playerName, start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm'});
+    }
   }
-  mpState.conns.forEach(conn=> conn.send({t:'pool', clipId:mpState.clip.id, performances:payload}));
+  const {buffer, index} = await concatBlobsWithIndex(blobs);
+  fragIndexMeta.forEach((m,i)=>{ m.offset = index[i].offset; m.length = index[i].length; });
+  for(const conn of mpState.conns){
+    try{
+      await sendChunked(conn, {t:'pool', clipId:mpState.clip.id, fragIndexMeta}, buffer);
+    }catch(e){
+      mpStatus(`No se pudo enviar la votación a ${escapeHtml(conn._name||'un jugador')}. Puede que necesite reconectarse.`);
+    }
+  }
   mpState.votes = {};
   mpRenderVoting(mpState.clip, mpState.hostPool, true);
 }
@@ -1922,9 +1962,31 @@ async function mpGuestHandle(msg){
     mpStatus('Clip recibido.');
     await mpStartRound(clip, false);
   }
-  else if(msg.t==='pool'){
-    const performances = msg.performances.map(p=>({id:p.id, clipId:mpState.clip.id, playerName:p.playerName, fragments:p.fragments.map(f=>({start:f.start,end:f.end,text:f.text||'',leadTrim:f.leadTrim||0,audioBlob:bufToBlob(f.buf,f.mime)})), createdAt:Date.now()}));
+  else if(msg.t==='pool-meta'){
+    mpState._rxPool = {meta:msg, chunks:new Array(msg.totalChunks), got:0};
+    mpStatus('Recibiendo las tomas para votar… 0%');
+  }
+  else if(msg.t==='pool-chunk'){
+    const rx = mpState._rxPool;
+    if(!rx) return;
+    rx.chunks[msg.i] = msg.buf; rx.got++;
+    if(rx.got % 8 === 0 || rx.got === rx.meta.totalChunks)
+      mpStatus(`Recibiendo las tomas para votar… ${Math.round(rx.got/rx.meta.totalChunks*100)}%`);
+  }
+  else if(msg.t==='pool-end'){
+    const rx = mpState._rxPool;
+    if(!rx) return;
+    mpState._rxPool = null;
+    if(rx.chunks.some(c=>!c)){ mpStatus('Se perdió parte de las tomas. Pide al anfitrión reenviarlas (puede cerrar y volver a "Cerrar y pasar a votación").'); return; }
+    const fullBlob = new Blob(rx.chunks);
+    const map = new Map();
+    rx.meta.fragIndexMeta.forEach(fm=>{
+      if(!map.has(fm.perfId)) map.set(fm.perfId, {id:fm.perfId, clipId:mpState.clip.id, playerName:fm.playerName, fragments:[], createdAt:Date.now()});
+      map.get(fm.perfId).fragments.push({start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')});
+    });
+    const performances = [...map.values()];
     for(const p of performances) await idbPut('performances', p);
+    mpStatus('');
     mpRenderVoting(mpState.clip, performances, false);
   }
   else if(msg.t==='tally'){ mpUpdateTallyUI(msg.counts, msg.voted, msg.total); }
@@ -1977,10 +2039,23 @@ async function mpOnMyComplete(perf, isHost){
     mpHostRenderWaiting();
   } else {
     const el = document.getElementById('mpBody');
+    el.innerHTML = `<h2>Enviando tu toma…</h2><p class="hint" id="mpStatus">Preparando el audio…</p>`;
+    await mpSendSubmit(perf);
     el.innerHTML = `<h2>¡Toma enviada!</h2><p class="hint">Esperando a que el resto termine…</p>${chatBoxHTML()}`;
     initChatBox();
     mpStatus('');
-    mpState.conn.send({t:'submit', name:mpState.myName, fragments: await Promise.all(perf.fragments.map(async f=>({start:f.start,end:f.end,text:f.text||'',leadTrim:f.leadTrim||0,buf:await blobToBuf(f.audioBlob), mime:f.audioBlob.type})))});
+  }
+}
+
+async function mpSendSubmit(perf){
+  const blobs = perf.fragments.map(f=>f.audioBlob);
+  const {buffer, index} = await concatBlobsWithIndex(blobs);
+  const fragMeta = perf.fragments.map((f,i)=>({start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm', offset:index[i].offset, length:index[i].length}));
+  try{
+    await sendChunked(mpState.conn, {t:'submit', name:mpState.myName, fragMeta}, buffer,
+      (done,total)=> mpStatus(`Enviando tu toma… ${Math.round(done/total*100)}%`));
+  }catch(e){
+    mpStatus('No se pudo enviar tu toma. Revisa tu conexión e inténtalo de nuevo desde "Multijugador".');
   }
 }
 
