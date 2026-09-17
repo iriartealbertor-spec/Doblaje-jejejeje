@@ -84,6 +84,13 @@ button{font-family:inherit; cursor:pointer;}
   .music-live{font-size:.75rem;}
   .rec-progress-wrap{width:90%; max-width:280px;}
   video{max-height:46vh;}
+  /* los overlays "opacos" (revisar toma, prepárate, avisos) pasan a pantalla completa
+     con scroll, para que nunca queden atrapados dentro del recuadro chico del video */
+  .overlay:not(.see-through){
+    position:fixed; inset:0; z-index:60;
+    justify-content:flex-start; padding-top:max(20px, env(safe-area-inset-top));
+    padding-bottom:max(20px, env(safe-area-inset-bottom));
+  }
 }
 @media (max-width:420px){
   .clip-grid{grid-template-columns:1fr;}
@@ -146,6 +153,7 @@ video{width:100%; border-radius:var(--radius); background:#000; display:block;}
   position:absolute; inset:0; background:rgba(15,12,8,.92);
   display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:16px; text-align:center; padding:24px; border-radius:var(--radius);
+  overflow-y:auto;
 }
 .overlay h2{font-size:1.6rem; color:var(--amber);}
 /* overlay que NO tapa el video (modo grabación / reproducción) */
@@ -1143,21 +1151,33 @@ async function showTakeReview(blob){
     </div>`;
   drawReviewWave(blob);
   document.getElementById('btnRedo').onclick = ()=> runFragment(playState.activeFrag, playState.isRedo);
-  document.getElementById('btnConfirmTake').onclick = async ()=>{
-    const {clip, activeFrag, isRedo, audioCtx} = playState;
-    const leadTrim = await detectLeadSilence(blob, audioCtx);
-    playState.takes[activeFrag] = {start: clip.fragments[activeFrag].start, end: clip.fragments[activeFrag].end, audioBlob: blob, leadTrim};
-    if(isRedo){
-      renderTimeline();
-      if(playState.takes.every(t=>t)) finishPlaySession();
-      else showRedoDoneScreen();
-    } else {
-      playState.idx = nextFragmentToRecord(activeFrag+1);
-      if(playState.idx >= clip.fragments.length){
-        finishPlaySession();
+  document.getElementById('btnConfirmTake').onclick = async (e)=>{
+    const confirmBtn = e.currentTarget;
+    if(confirmBtn.disabled) return; // evita doble envío si tocan varias veces
+    confirmBtn.disabled = true;
+    document.getElementById('btnRedo').disabled = true;
+    try{
+      const {clip, activeFrag, isRedo, audioCtx} = playState;
+      const leadTrim = await detectLeadSilence(blob, audioCtx);
+      playState.takes[activeFrag] = {start: clip.fragments[activeFrag].start, end: clip.fragments[activeFrag].end, audioBlob: blob, leadTrim};
+      if(isRedo){
+        renderTimeline();
+        if(playState.takes.every(t=>t)) finishPlaySession();
+        else showRedoDoneScreen();
       } else {
-        runFragment(playState.idx, false);
+        playState.idx = nextFragmentToRecord(activeFrag+1);
+        if(playState.idx >= clip.fragments.length){
+          finishPlaySession();
+        } else {
+          runFragment(playState.idx, false);
+        }
       }
+    }catch(err){
+      // si algo falla, se reactivan los botones para no dejar al jugador trabado
+      confirmBtn.disabled = false;
+      const redoBtn = document.getElementById('btnRedo');
+      if(redoBtn) redoBtn.disabled = false;
+      alert('Hubo un problema al confirmar la toma, inténtalo de nuevo. ('+(err.message||err)+')');
     }
   };
 }
@@ -1244,30 +1264,37 @@ async function detectLeadSilence(blob, audioCtx){
 
 async function finishPlaySession(){
   const {clip, playerName, takes, micStream, audioCtx, onComplete} = playState;
-  const vid = document.getElementById('playVideo');
-  vid.pause();
-  musicStop();
-  clearInterval(vuInterval);
-  micStream.getTracks().forEach(t=>t.stop());
-  if(audioCtx.state !== 'closed') audioCtx.close();
-  const perf = {id: uid(), clipId: clip.id, playerName,
-    fragments: takes.map((t,i)=>({...t, text: clip.fragments[i].text||''})), createdAt: Date.now()};
-  await idbPut('performances', perf);
-  releasePool('review');
-  const overlay = document.getElementById('playOverlay');
-  overlay.className='overlay'; overlay.style.display='flex';
-  if(onComplete){ onComplete(perf); playState = null; return; }
-  overlay.innerHTML = `<h2>¡Listo, ${escapeHtml(playerName)}!</h2><p class="hint">Tu toma se guardó. Ve a "Comparar tomas" para escucharla sobre el video.</p>
-    <div style="display:flex; gap:10px;">
-      <button class="btn" id="btnAnother">Grabar otra toma</button>
-      <button class="btn btn-amber" id="btnGoCompare">Ir a comparar</button>
-    </div>`;
-  document.getElementById('btnAnother').onclick = ()=>{
-    document.getElementById('playStage').style.display='none';
-    document.getElementById('playSetup').style.display='block';
-  };
-  document.getElementById('btnGoCompare').onclick = ()=> showView('compare');
-  playState = null;
+  try{
+    const vid = document.getElementById('playVideo');
+    vid.pause();
+    musicStop();
+    clearInterval(vuInterval);
+    micStream.getTracks().forEach(t=>t.stop());
+    if(audioCtx.state !== 'closed') audioCtx.close();
+    const perf = {id: uid(), clipId: clip.id, playerName,
+      fragments: takes.map((t,i)=>({...t, text: clip.fragments[i].text||''})), createdAt: Date.now()};
+    await idbPut('performances', perf);
+    releasePool('review');
+    const overlay = document.getElementById('playOverlay');
+    overlay.className='overlay'; overlay.style.display='flex';
+    if(onComplete){ onComplete(perf); playState = null; return; }
+    overlay.innerHTML = `<h2>¡Listo, ${escapeHtml(playerName)}!</h2><p class="hint">Tu toma se guardó. Ve a "Comparar tomas" para escucharla sobre el video.</p>
+      <div style="display:flex; gap:10px;">
+        <button class="btn" id="btnAnother">Grabar otra toma</button>
+        <button class="btn btn-amber" id="btnGoCompare">Ir a comparar</button>
+      </div>`;
+    document.getElementById('btnAnother').onclick = ()=>{
+      document.getElementById('playStage').style.display='none';
+      document.getElementById('playSetup').style.display='block';
+    };
+    document.getElementById('btnGoCompare').onclick = ()=> showView('compare');
+    playState = null;
+  }catch(err){
+    alert('Hubo un problema al guardar tu toma: '+(err.message||err)+'. Intenta confirmar de nuevo.');
+    const cbtn = document.getElementById('btnConfirmTake'), rbtn = document.getElementById('btnRedo');
+    if(cbtn) cbtn.disabled = false;
+    if(rbtn) rbtn.disabled = false;
+  }
 }
 
 /* ---------- COMPARE ---------- */
@@ -1704,36 +1731,51 @@ async function mpHostStartGame(){
   const preMb = clip.videoBlob.size/1048576;
   if(preMb > 60 && !confirm(`El clip pesa ${preMb.toFixed(0)} MB. Enviarlo por internet a cada jugador puede tardar bastante o fallar en conexiones lentas. ¿Continuar?`)) return;
   mpState.clip = clip;
-  const videoBuf = await blobToBuf(clip.videoBlob);
-  const mb = (videoBuf.byteLength/1048576).toFixed(1);
   const btn = document.getElementById('mpBtnStart');
   if(btn) btn.disabled = true;
-  mpStatus(`Enviando el clip (${mb} MB) a ${mpState.conns.length} jugador(es)…`);
 
-  // primero la música (si hay), después el video: al llegar el video empieza la ronda
-  if(clip.music && clip.music.blob){
-    const musicBuf = await blobToBuf(clip.music.blob);
-    mpStatus('Enviando la música…');
-    await Promise.all(mpState.conns.map(conn=>
+  try{
+    // se filtran conexiones ya cerradas para que una desconexión no tumbe el envío a los demás
+    const liveConns = mpState.conns.filter(c=> c.open !== false);
+    if(!liveConns.length && mpState.conns.length){
+      mpStatus('Parece que se desconectaron todos los jugadores. Espera a que alguien se una de nuevo.');
+      if(btn) btn.disabled = false;
+      return;
+    }
+
+    // primero la música (si hay), después el video: al llegar el video empieza la ronda
+    if(clip.music && clip.music.blob){
+      const musicBuf = await blobToBuf(clip.music.blob);
+      mpStatus('Enviando la música…');
+      await Promise.allSettled(liveConns.map(conn=>
+        sendChunked(conn,
+          {t:'music', name:clip.music.name||'Música', volume:clip.music.volume ?? .5, mime:clip.music.blob.type||'audio/mpeg'},
+          musicBuf,
+          (done,total)=>{ if(done%16===0||done===total) mpStatus(`Enviando la música… ${Math.round(done/total*100)}%`); }
+        )
+      ));
+    }
+
+    const videoBuf = await blobToBuf(clip.videoBlob);
+    const mb = (videoBuf.byteLength/1048576).toFixed(1);
+    mpStatus(`Enviando el clip (${mb} MB) a ${liveConns.length} jugador(es)…`);
+
+    const results = await Promise.allSettled(liveConns.map(conn=>
       sendChunked(conn,
-        {t:'music', name:clip.music.name||'Música', volume:clip.music.volume ?? .5, mime:clip.music.blob.type||'audio/mpeg'},
-        musicBuf,
-        (done,total)=>{ if(done%16===0||done===total) mpStatus(`Enviando la música… ${Math.round(done/total*100)}%`); }
+        {t:'clip', clipId:clip.id, name:clip.name, mime:clip.videoBlob.type||'video/mp4',
+         duration:clip.duration, fragments:clip.fragments},
+        videoBuf,
+        (done,total)=>{ if(done%16===0||done===total) mpStatus(`Enviando el clip… ${Math.round(done/total*100)}%`); }
       )
     ));
+    const failed = results.filter(r=>r.status==='rejected').length;
+    mpStatus(failed ? `Clip enviado, pero ${failed} jugador(es) no lo recibieron bien. Puede que necesiten reconectarse.` : 'Clip enviado. ¡A grabar!');
+    mpState.hostPool = [];
+    await mpStartRound(clip, true);
+  }catch(err){
+    mpStatus('Algo falló enviando el clip: '+(err.message||err)+'. Intenta de nuevo.');
+    if(btn) btn.disabled = false;
   }
-
-  await Promise.all(mpState.conns.map(conn=>
-    sendChunked(conn,
-      {t:'clip', clipId:clip.id, name:clip.name, mime:clip.videoBlob.type||'video/mp4',
-       duration:clip.duration, fragments:clip.fragments},
-      videoBuf,
-      (done,total)=>{ if(done%16===0||done===total) mpStatus(`Enviando el clip… ${Math.round(done/total*100)}%`); }
-    )
-  ));
-  mpStatus('Clip enviado. ¡A grabar!');
-  mpState.hostPool = [];
-  await mpStartRound(clip, true);
 }
 
 function mpHostHandle(conn, msg){
