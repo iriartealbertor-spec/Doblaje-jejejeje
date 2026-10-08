@@ -2105,6 +2105,7 @@ async function mpStartRound(clip, isHost){
 
   playState = {
     clip, playerName: mpState.myName, keepOriginal, showSubs, micStream, audioCtx, origBuffer,
+    onlyChar:'__all',   // en multijugador cada quien graba TODAS las voces
     idx:0, takes: new Array(clip.fragments.length).fill(null), activeFrag:0, isRedo:false,
     musicEl: null,
     onComplete: perf => mpOnMyComplete(perf, isHost)
@@ -2183,6 +2184,7 @@ async function mpTrySendSubmit(perf){
 }
 
 async function mpSendSubmit(perf){
+  if(!perf.fragments || perf.fragments.some(f=>!f || !f.audioBlob)) throw new Error('tu toma está incompleta (faltan voces por grabar)');
   const blobs = perf.fragments.map(f=>f.audioBlob);
   const {buffer, index} = await concatBlobsWithIndex(blobs);
   const fragMeta = perf.fragments.map((f,i)=>({start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm', offset:index[i].offset, length:index[i].length}));
