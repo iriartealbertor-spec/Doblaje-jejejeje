@@ -392,7 +392,7 @@ footer.note{margin-top:26px; font-size:.78rem; color:var(--text-dim); line-heigh
       <div class="panel" id="mpBody"></div>
     </section>
 
-    <footer class="note"><b>versión 8-oct-b</b> · Uso personal. Sube solo clips que ya tengas derecho a usar — esta herramienta no incluye ni descarga contenido con derechos de autor.</footer>
+    <footer class="note"><b>versión 8-oct-c (reparto)</b> · Uso personal. Sube solo clips que ya tengas derecho a usar — esta herramienta no incluye ni descarga contenido con derechos de autor.</footer>
   </main>
 </div>
 
@@ -892,17 +892,23 @@ document.getElementById('btnStartPlay').onclick = async ()=>{
 
 /* si se eligió "solo este personaje", autocompleta con el audio original
    los fragmentos de los demás personajes para que la toma quede completa */
+/* personaje de una línea; las líneas sin nombre cuentan como "(sin personaje)" */
+function roleOf(f){ return (f && f.speaker) || '(sin personaje)'; }
+/* onlyChar puede ser '__all', un nombre de personaje (modo solo) o una lista de personajes (reparto) */
+function isMyFrag(onlyChar, f){ return Array.isArray(onlyChar) ? onlyChar.includes(roleOf(f)) : f.speaker === onlyChar; }
+
 async function autoFillOtherCharacters(){
   const {clip, onlyChar, origBuffer, audioCtx} = playState;
-  if(onlyChar === '__all' || !origBuffer) return;
+  if(onlyChar === '__all') return;
   for(let i=0;i<clip.fragments.length;i++){
     const f = clip.fragments[i];
-    if(f.speaker === onlyChar) continue;
-    const sr = origBuffer.sampleRate;
-    const from = Math.max(0, Math.floor(f.start*sr)), to = Math.min(origBuffer.length, Math.floor(f.end*sr));
+    if(isMyFrag(onlyChar, f)) continue;
+    const sr = origBuffer ? origBuffer.sampleRate : 44100;
+    const from = origBuffer ? Math.max(0, Math.floor(f.start*sr)) : 0;
+    const to = origBuffer ? Math.min(origBuffer.length, Math.floor(f.end*sr)) : Math.floor((f.end-f.start)*sr);
     const len = Math.max(1, to-from);
     const buf = audioCtx.createBuffer(1, len, sr);
-    buf.copyToChannel(origBuffer.getChannelData(0).slice(from,to), 0);
+    if(origBuffer) buf.copyToChannel(origBuffer.getChannelData(0).slice(from,to), 0);
     const blob = await bufferToWavBlob(buf);
     playState.takes[i] = {start:f.start, end:f.end, audioBlob:blob, isOriginal:true};
   }
@@ -911,7 +917,7 @@ function nextFragmentToRecord(from){
   const {clip, onlyChar} = playState;
   if(onlyChar === '__all') return from;
   for(let i=from;i<clip.fragments.length;i++){
-    if(clip.fragments[i].speaker === onlyChar) return i;
+    if(isMyFrag(onlyChar, clip.fragments[i])) return i;
   }
   return clip.fragments.length; // no queda nada por grabar de este personaje
 }
@@ -1710,6 +1716,62 @@ async function mpCreateRoom(){
   });
 }
 
+/* asignación de personajes (modo reparto) */
+async function mpRenderCastBox(){
+  const box = document.getElementById('mpCastBox');
+  if(!box) return;
+  const sel = document.getElementById('mpClipSelect');
+  if(mpState.mode !== 'cast' || !sel || !sel.value){ box.innerHTML=''; return; }
+  const clip = await idbGet('clips', sel.value);
+  const frags = (clip && clip.fragments) || [];
+  if(!frags.some(f=>f.speaker)){
+    mpState.roles = null;
+    box.innerHTML = '<p class="hint">Esta escena no tiene personajes. Ponle nombre a cada voz en "Preparar escena" (campo Personaje) para usar este modo.</p>';
+    return;
+  }
+  const roles = [...new Set(frags.map(roleOf))];
+  const players = [mpState.myName, ...mpState.conns.filter(c=>c._name).map(c=>c._name)];
+  const prev = mpState.roles || {};
+  const map = {};
+  roles.forEach((r,i)=>{ map[r] = players.includes(prev[r]) ? prev[r] : players[i % players.length]; });
+  mpState.roles = map;
+  box.innerHTML = '<p class="hint">Asigna quién hace cada personaje (cada jugador necesita al menos uno):</p>' +
+    roles.map((r,i)=>`<div class="participant-row"><span>${escapeHtml(r)}</span>
+      <select data-ri="${i}">${players.map(n=>`<option ${map[r]===n?'selected':''}>${escapeHtml(n)}</option>`).join('')}</select></div>`).join('');
+  box.querySelectorAll('select[data-ri]').forEach(s=> s.onchange = ()=>{ mpState.roles[roles[+s.dataset.ri]] = s.value; });
+}
+
+/* completa con el audio original las líneas que el jugador no grabó (no viajan por la red) */
+async function fillOriginalFragments(clip, perfs){
+  if(!perfs.some(p=>p.fragments.some(f=>!f.audioBlob))) return;
+  const ctx = new (window.AudioContext||window.webkitAudioContext)();
+  let buf = null;
+  try{ buf = await ctx.decodeAudioData(await clip.videoBlob.slice(0).arrayBuffer()); }catch(e){}
+  for(const p of perfs){
+    for(const f of p.fragments){
+      if(f.audioBlob) continue;
+      const sr = buf ? buf.sampleRate : 44100;
+      const from = buf ? Math.max(0, Math.floor(f.start*sr)) : 0;
+      const to = buf ? Math.min(buf.length, Math.floor(f.end*sr)) : Math.floor((f.end-f.start)*sr);
+      const ab = ctx.createBuffer(1, Math.max(1,to-from), sr);
+      if(buf) ab.copyToChannel(buf.getChannelData(0).slice(from,to), 0);
+      f.audioBlob = await bufferToWavBlob(ab);
+      f.isOriginal = true;
+    }
+  }
+  try{ ctx.close(); }catch(e){}
+}
+
+/* escena completa con todo el reparto: cada línea sale del jugador que tiene ese personaje */
+function buildCastPerf(perfs, roles, clip){
+  const byName = new Map(perfs.map(p=>[p.playerName, p]));
+  const fragments = clip.fragments.map((cf,i)=>{
+    const owner = byName.get(roles[roleOf(cf)]) || perfs[0];
+    return {...owner.fragments[i]};
+  });
+  return {id:'__cast', clipId:clip.id, playerName:'🎬 Escena completa (reparto)', noVote:true, fragments, createdAt:Date.now()};
+}
+
 function mpHostBroadcastLobby(){
   const players = [mpState.myName+' (anfitrión)', ...mpState.conns.filter(c=>c._name).map(c=>c._name)];
   mpState.conns.forEach(c=>{ try{ if(c.open!==false) c.send({t:'lobby', code:mpState.code, host:mpState.myName, players}); }catch(e){} });
@@ -1727,7 +1789,12 @@ async function mpHostRenderLobby(){
     <h3 style="margin-top:20px; font-size:1.05rem;">Jugadores conectados (${mpState.conns.length})</h3>
     <div id="mpParticipants">${mpState.conns.length? mpState.conns.map(c=>`<div class="participant-row"><span><span class="status-dot ${c._name?'ok':''}"></span>${escapeHtml(c._name||'conectando…')}</span></div>`).join('') : '<p class="hint">Todavía no se une nadie.</p>'}</div>
     <h3 style="margin-top:20px; font-size:1.05rem;">Escena a jugar</h3>
-    <select id="mpClipSelect">${clips.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('') || '<option disabled>No tienes escenas — prepara una primero</option>'}</select>
+    <select id="mpClipSelect">${clips.map(c=>`<option value="${c.id}" ${c.id===mpState.selClipId?'selected':''}>${escapeHtml(c.name)}</option>`).join('') || '<option disabled>No tienes escenas — prepara una primero</option>'}</select>
+    <div style="margin-top:14px;">
+      <label style="display:flex; gap:8px; align-items:center; color:var(--text);"><input type="radio" name="mpMode" value="all" ${mpState.mode!=='cast'?'checked':''} style="width:auto;"> Todos doblan todo (compiten entre sí)</label>
+      <label style="display:flex; gap:8px; align-items:center; color:var(--text); margin-top:6px;"><input type="radio" name="mpMode" value="cast" ${mpState.mode==='cast'?'checked':''} style="width:auto;"> Un personaje por jugador (reparto)</label>
+    </div>
+    <div id="mpCastBox" style="margin-top:8px;"></div>
     <div style="margin-top:16px; display:flex; gap:8px;">
       <button class="btn btn-amber" id="mpBtnStart" ${clips.length?'':'disabled'}>Enviar clip y empezar</button>
       <button class="btn btn-ghost" id="mpBtnLeave">Cerrar sala</button>
@@ -1736,6 +1803,11 @@ async function mpHostRenderLobby(){
     ${chatBoxHTML()}
   `;
   document.getElementById('mpBtnStart').onclick = mpHostStartGame;
+  const clipSel = document.getElementById('mpClipSelect');
+  clipSel.onchange = ()=>{ mpState.selClipId = clipSel.value; mpState.roles = null; mpRenderCastBox(); };
+  if(clipSel.value) mpState.selClipId = clipSel.value;
+  document.querySelectorAll('input[name="mpMode"]').forEach(r=> r.onchange = ()=>{ mpState.mode = r.value; mpRenderCastBox(); });
+  mpRenderCastBox();
   document.getElementById('mpBtnLeave').onclick = ()=>{ mpState.peer.destroy(); mpState=null; mpShowChoice(); };
   initChatBox();
 }
@@ -1770,6 +1842,16 @@ async function mpHostStartGame(){
   const clip = await idbGet('clips', clipId);
   const preMb = clip.videoBlob.size/1048576;
   if(preMb > 60 && !confirm(`El clip pesa ${preMb.toFixed(0)} MB. Enviarlo por internet a cada jugador puede tardar bastante o fallar en conexiones lentas. ¿Continuar?`)) return;
+  let castRoles = null;
+  if(mpState.mode === 'cast'){
+    castRoles = mpState.roles;
+    if(!castRoles){ mpStatus('El modo reparto necesita una escena con personajes nombrados.'); return; }
+    const players = [mpState.myName, ...mpState.conns.filter(c=>c._name && c.open!==false).map(c=>c._name)];
+    const used = new Set(Object.values(castRoles));
+    const idle = players.filter(n=>!used.has(n));
+    if(idle.length){ mpStatus(`${idle.map(escapeHtml).join(', ')} no tiene personaje. Asigna al menos uno a cada jugador (o usa "Todos doblan todo").`); return; }
+  }
+  mpState.castRoles = castRoles;
   mpState.clip = clip;
   mpState.started = true;   // a partir de aquí la sala se cierra a nuevos jugadores
   const btn = document.getElementById('mpBtnStart');
@@ -1805,7 +1887,8 @@ async function mpHostStartGame(){
     const results = await Promise.allSettled(liveConns.map(conn=>
       sendChunked(conn,
         {t:'clip', clipId:clip.id, name:clip.name, mime:clip.videoBlob.type||'video/mp4',
-         duration:clip.duration, fragments:clip.fragments},
+         duration:clip.duration, fragments:clip.fragments,
+         mode: castRoles ? 'cast' : 'all', roles: castRoles},
         videoBuf,
         (done,total)=>{ if(done%16===0||done===total) mpStatus(`Enviando el clip… ${Math.round(done/total*100)}%`); }
       )
@@ -1821,7 +1904,7 @@ async function mpHostStartGame(){
   }
 }
 
-function mpHostHandle(conn, msg){
+async function mpHostHandle(conn, msg){
   if(msg.t==='hello'){
     // nombres únicos: si ya existe, se le agrega un número
     let base = (msg.name||'Jugador').trim() || 'Jugador', name = base, n = 2;
@@ -1851,8 +1934,11 @@ function mpHostHandle(conn, msg){
     // si reenvía (reintento), se reemplaza su toma anterior en vez de duplicarla
     if(conn._perfId) mpState.hostPool = mpState.hostPool.filter(p=>p.id!==conn._perfId);
     const perf = {id:uid(), clipId:mpState.clip.id, playerName: conn._name||rx.meta.name,
-      fragments: rx.meta.fragMeta.map(fm=>({start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')})),
+      fragments: rx.meta.fragMeta.map(fm=> fm.orig
+        ? {start:fm.start, end:fm.end, text:fm.text||'', leadTrim:0, audioBlob:null, isOriginal:true}
+        : {start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')}),
       createdAt:Date.now()};
+    await fillOriginalFragments(mpState.clip, [perf]);
     idbPut('performances', perf);
     mpState.hostPool.push(perf);
     conn._perfId = perf.id;
@@ -1894,12 +1980,17 @@ async function mpHostClosePoolAndVote(){
   const blobs = []; const fragIndexMeta = [];
   for(const perf of mpState.hostPool){
     for(const f of perf.fragments){
-      blobs.push(f.audioBlob);
-      fragIndexMeta.push({perfId:perf.id, playerName:perf.playerName, start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm'});
+      if(f.isOriginal){
+        fragIndexMeta.push({perfId:perf.id, playerName:perf.playerName, start:f.start, end:f.end, text:f.text||'', orig:true});
+      } else {
+        blobs.push(f.audioBlob);
+        fragIndexMeta.push({perfId:perf.id, playerName:perf.playerName, start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm'});
+      }
     }
   }
   const {buffer, index} = await concatBlobsWithIndex(blobs);
-  fragIndexMeta.forEach((m,i)=>{ m.offset = index[i].offset; m.length = index[i].length; });
+  let k = 0;
+  fragIndexMeta.forEach(m=>{ if(m.orig) return; m.offset = index[k].offset; m.length = index[k++].length; });
   for(const conn of mpState.conns){
     try{
       await sendChunked(conn, {t:'pool', clipId:mpState.clip.id, fragIndexMeta}, buffer);
@@ -1908,7 +1999,8 @@ async function mpHostClosePoolAndVote(){
     }
   }
   mpState.votes = {};
-  mpRenderVoting(mpState.clip, mpState.hostPool, true);
+  const list = mpState.castRoles ? [buildCastPerf(mpState.hostPool, mpState.castRoles, mpState.clip), ...mpState.hostPool] : mpState.hostPool;
+  mpRenderVoting(mpState.clip, list, true);
 }
 
 function mpHostBroadcastTally(){
@@ -2040,6 +2132,7 @@ async function mpGuestHandle(msg){
     const m = rx.meta;
     if(mpState._roundClipId === m.clipId && mpState._inGame) return;   // clip duplicado: ya está jugando
     mpState._roundClipId = m.clipId;
+    mpState.castRoles = (m.mode==='cast' && m.roles) ? m.roles : null;
     mpState._inGame = true;
     const clip = {id:m.clipId, name:m.name, videoBlob:new Blob(rx.chunks, {type:m.mime||'video/mp4'}),
                   duration:m.duration, fragments:m.fragments, createdAt:Date.now(),
@@ -2070,12 +2163,16 @@ async function mpGuestHandle(msg){
     const map = new Map();
     rx.meta.fragIndexMeta.forEach(fm=>{
       if(!map.has(fm.perfId)) map.set(fm.perfId, {id:fm.perfId, clipId:mpState.clip.id, playerName:fm.playerName, fragments:[], createdAt:Date.now()});
-      map.get(fm.perfId).fragments.push({start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')});
+      map.get(fm.perfId).fragments.push(fm.orig
+        ? {start:fm.start, end:fm.end, text:fm.text||'', leadTrim:0, audioBlob:null, isOriginal:true}
+        : {start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')});
     });
     const performances = [...map.values()];
+    await fillOriginalFragments(mpState.clip, performances);
     for(const p of performances) await idbPut('performances', p);
     mpStatus('');
-    mpRenderVoting(mpState.clip, performances, false);
+    const list = mpState.castRoles ? [buildCastPerf(performances, mpState.castRoles, mpState.clip), ...performances] : performances;
+    mpRenderVoting(mpState.clip, list, false);
   }
   else if(msg.t==='tally'){ mpUpdateTallyUI(msg.counts, msg.voted, msg.total); }
   else if(msg.t==='final'){ mpRenderFinal(msg.counts); }
@@ -2106,15 +2203,19 @@ async function mpStartRound(clip, isHost){
   vid.muted = !keepOriginal;
   await new Promise(r=>{vid.onloadedmetadata=r;});
 
+  // reparto: solo se graban los personajes asignados a este jugador; "todos doblan todo": todos
+  const myRoles = mpState.castRoles ? Object.keys(mpState.castRoles).filter(r=>mpState.castRoles[r]===mpState.myName) : null;
   playState = {
     clip, playerName: mpState.myName, keepOriginal, showSubs, micStream, audioCtx, origBuffer,
-    onlyChar:'__all',   // en multijugador cada quien graba TODAS las voces
+    onlyChar: myRoles || '__all',
     idx:0, takes: new Array(clip.fragments.length).fill(null), activeFrag:0, isRedo:false,
     musicEl: null,
     onComplete: perf => mpOnMyComplete(perf, isHost)
   };
   playState.musicEl = makeMusicEl(clip);
-  runFragment(0, false);
+  await autoFillOtherCharacters();
+  const first = nextFragmentToRecord(0);
+  if(first >= clip.fragments.length) finishPlaySession(); else runFragment(first, false);
 }
 
 async function mpOnMyComplete(perf, isHost){
@@ -2188,9 +2289,13 @@ async function mpTrySendSubmit(perf){
 
 async function mpSendSubmit(perf){
   if(!perf.fragments || perf.fragments.some(f=>!f || !f.audioBlob)) throw new Error('tu toma está incompleta (faltan voces por grabar)');
-  const blobs = perf.fragments.map(f=>f.audioBlob);
-  const {buffer, index} = await concatBlobsWithIndex(blobs);
-  const fragMeta = perf.fragments.map((f,i)=>({start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm', offset:index[i].offset, length:index[i].length}));
+  // las líneas con audio original no se envían: el anfitrión las reconstruye con su copia del clip
+  const real = perf.fragments.filter(f=>!f.isOriginal);
+  const {buffer, index} = await concatBlobsWithIndex(real.map(f=>f.audioBlob));
+  let k = 0;
+  const fragMeta = perf.fragments.map(f=> f.isOriginal
+    ? {start:f.start, end:f.end, text:f.text||'', orig:true}
+    : {start:f.start, end:f.end, text:f.text||'', leadTrim:f.leadTrim||0, mime:f.audioBlob.type||'audio/webm', offset:index[k].offset, length:index[k++].length});
   await sendChunked(mpState.conn, {t:'submit', name:mpState.myName, fragMeta}, buffer,
     (doneChunks,total)=> mpStatus(`Enviando tu toma… ${Math.round(doneChunks/total*100)}%`));
 }
@@ -2202,8 +2307,10 @@ function mpRenderVoting(clip, performances, isHost){
   mpState.myVote = null;
   const el = document.getElementById('mpBody');
   el.innerHTML = `
-    <h2>Vota por tu favorita</h2>
-    <p class="hint">Escucha cada toma sobre el video y vota por la que más te gustó (no puedes votarte a ti mismo).</p>
+    <h2>${mpState.castRoles ? 'Vota al mejor actor' : 'Vota por tu favorita'}</h2>
+    <p class="hint">${mpState.castRoles
+      ? 'La primera fila es la escena completa con todo el reparto. En la de cada jugador solo se oye su voz y el resto es el audio original; vota por quien mejor lo hizo (no puedes votarte a ti mismo).'
+      : 'Escucha cada toma sobre el video y vota por la que más te gustó (no puedes votarte a ti mismo).'}</p>
     <video id="mpVoteVideo" style="max-width:420px;"></video>
     <div id="mpVoteSub" class="hint" style="margin-top:6px; min-height:1.3em;"></div>
     <div id="mpVoteList"></div>
@@ -2217,13 +2324,15 @@ function mpRenderVoting(clip, performances, isHost){
     const row = document.createElement('div');
     row.className='vote-row';
     const mine = p.playerName === mpState.myName;
-    row.innerHTML = `<span>${escapeHtml(p.playerName)}${mine?' (tú)':''}</span>
+    const rl = (mpState.castRoles && !p.noVote) ? Object.keys(mpState.castRoles).filter(r=>mpState.castRoles[r]===p.playerName).join(', ') : '';
+    row.innerHTML = `<span>${escapeHtml(p.playerName)}${mine?' (tú)':''}${rl?` <span class="hint">— ${escapeHtml(rl)}</span>`:''}</span>
       <span style="display:flex; gap:6px;">
         <button class="btn btn-sm" data-play="${p.id}">▶ Escuchar</button>
-        <button class="btn btn-sm btn-amber" data-vote="${p.id}" ${mine?'disabled':''}>Votar</button>
+        ${p.noVote ? '' : `<button class="btn btn-sm btn-amber" data-vote="${p.id}" ${mine?'disabled':''}>Votar</button>`}
       </span>`;
     row.querySelector('[data-play]').onclick = ()=> mpPlayPerf(clip, p);
-    row.querySelector('[data-vote]').onclick = ()=> mpCastVote(p.id, isHost);
+    const vb = row.querySelector('[data-vote]');
+    if(vb) vb.onclick = ()=> mpCastVote(p.id, isHost);
     list.appendChild(row);
   });
   if(isHost){
@@ -2287,7 +2396,7 @@ function mpUpdateTallyUI(counts, voted, total){
   const box = document.getElementById('mpTally');
   if(!box || !mpState._perfs) return;
   const maxVotes = Math.max(1, ...Object.values(counts));
-  box.innerHTML = `<p class="hint">${voted} de ${total} ya votaron.</p>` + mpState._perfs.map(p=>{
+  box.innerHTML = `<p class="hint">${voted} de ${total} ya votaron.</p>` + mpState._perfs.filter(p=>!p.noVote).map(p=>{
     const v = counts[p.id]||0;
     return `<div style="margin-top:8px;"><span>${escapeHtml(p.playerName)} — ${v} voto${v===1?'':'s'}</span>
       <div class="vote-bar-track"><div class="vote-bar-fill" style="width:${(v/maxVotes)*100}%;"></div></div></div>`;
@@ -2298,7 +2407,7 @@ function mpRenderFinal(counts){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.getElementById('view-multi').classList.add('active');
   const el = document.getElementById('mpBody');
-  const perfs = (mpState._perfs||[]).slice().sort((a,b)=> (counts[b.id]||0)-(counts[a.id]||0));
+  const perfs = (mpState._perfs||[]).filter(p=>!p.noVote).sort((a,b)=> (counts[b.id]||0)-(counts[a.id]||0));
   const top = counts[perfs[0]?.id] || 0;
   el.innerHTML = `<h2>Resultados</h2>` + perfs.map((p,i)=>{
     const v = counts[p.id]||0;
