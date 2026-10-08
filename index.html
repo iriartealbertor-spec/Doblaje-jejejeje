@@ -392,11 +392,11 @@ footer.note{margin-top:26px; font-size:.78rem; color:var(--text-dim); line-heigh
       <div class="panel" id="mpBody"></div>
     </section>
 
-    <footer class="note">Uso personal. Sube solo clips que ya tengas derecho a usar — esta herramienta no incluye ni descarga contenido con derechos de autor.</footer>
+    <footer class="note"><b>versión 8-oct-b</b> · Uso personal. Sube solo clips que ya tengas derecho a usar — esta herramienta no incluye ni descarga contenido con derechos de autor.</footer>
   </main>
 </div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 /* ---------- IndexedDB ---------- */
 let db;
@@ -1263,6 +1263,9 @@ async function detectLeadSilence(blob, audioCtx){
 }
 
 async function finishPlaySession(){
+  // red de seguridad: nunca se da por terminada una toma con voces sin grabar
+  const missing = playState.takes.findIndex(t=>!t);
+  if(missing >= 0){ playState.idx = missing; runFragment(missing, false); return; }
   const {clip, playerName, takes, micStream, audioCtx, onComplete} = playState;
   try{
     const vid = document.getElementById('playVideo');
