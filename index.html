@@ -1688,16 +1688,33 @@ async function mpCreateRoom(){
   peer.on('open', ()=>{ mpHostRenderLobby(); });
   peer.on('error', e=> mpStatus('Error: '+ (e.message||e.type)+'. Prueba crear la sala de nuevo.'));
   peer.on('connection', conn=>{
+    // la partida ya empezó: no se admiten jugadores nuevos a medias
+    if(mpState.started){
+      conn.on('open', ()=>{ try{ conn.send({t:'locked'}); }catch(e){} setTimeout(()=>conn.close(), 400); });
+      return;
+    }
+    // misma conexión repetida (mismo navegador reconectando): se descarta la vieja
+    const dup = mpState.conns.find(c=>c.peer===conn.peer);
+    if(dup){ mpState.conns = mpState.conns.filter(c=>c!==dup); try{ dup.close(); }catch(e){} }
     mpState.conns.push(conn);
     conn.on('open', ()=>{
       conn.on('data', msg=> mpHostHandle(conn, msg));
-      mpHostRenderLobby();
     });
-    conn.on('close', ()=>{ mpState.conns = mpState.conns.filter(c=>c!==conn); mpHostRenderLobby(); });
+    conn.on('close', ()=>{
+      mpState.conns = mpState.conns.filter(c=>c!==conn);
+      if(!mpState.started) mpHostRenderLobby(); else if(mpState._waitingScreen) mpHostRenderWaiting();
+    });
   });
 }
 
+function mpHostBroadcastLobby(){
+  const players = [mpState.myName+' (anfitrión)', ...mpState.conns.filter(c=>c._name).map(c=>c._name)];
+  mpState.conns.forEach(c=>{ try{ if(c.open!==false) c.send({t:'lobby', code:mpState.code, host:mpState.myName, players}); }catch(e){} });
+}
+
 async function mpHostRenderLobby(){
+  mpState._waitingScreen = false;
+  mpHostBroadcastLobby();
   const clips = await idbAll('clips');
   const el = document.getElementById('mpBody');
   el.innerHTML = `
@@ -1751,6 +1768,7 @@ async function mpHostStartGame(){
   const preMb = clip.videoBlob.size/1048576;
   if(preMb > 60 && !confirm(`El clip pesa ${preMb.toFixed(0)} MB. Enviarlo por internet a cada jugador puede tardar bastante o fallar en conexiones lentas. ¿Continuar?`)) return;
   mpState.clip = clip;
+  mpState.started = true;   // a partir de aquí la sala se cierra a nuevos jugadores
   const btn = document.getElementById('mpBtnStart');
   if(btn) btn.disabled = true;
 
@@ -1759,6 +1777,7 @@ async function mpHostStartGame(){
     const liveConns = mpState.conns.filter(c=> c.open !== false);
     if(!liveConns.length && mpState.conns.length){
       mpStatus('Parece que se desconectaron todos los jugadores. Espera a que alguien se una de nuevo.');
+      mpState.started = false;
       if(btn) btn.disabled = false;
       return;
     }
@@ -1794,12 +1813,21 @@ async function mpHostStartGame(){
     await mpStartRound(clip, true);
   }catch(err){
     mpStatus('Algo falló enviando el clip: '+(err.message||err)+'. Intenta de nuevo.');
+    mpState.started = false;
     if(btn) btn.disabled = false;
   }
 }
 
 function mpHostHandle(conn, msg){
-  if(msg.t==='hello'){ conn._name = msg.name || 'Jugador'; mpHostRenderLobby(); }
+  if(msg.t==='hello'){
+    // nombres únicos: si ya existe, se le agrega un número
+    let base = (msg.name||'Jugador').trim() || 'Jugador', name = base, n = 2;
+    const taken = ()=> name===mpState.myName || mpState.conns.some(c=>c!==conn && c._name===name);
+    while(taken()) name = base+' ('+(n++)+')';
+    conn._name = name;
+    try{ conn.send({t:'welcome', name}); }catch(e){}
+    if(!mpState.started) mpHostRenderLobby();
+  }
   else if(msg.t==='submit-meta'){
     conn._rxSubmit = {meta:msg, chunks:new Array(msg.totalChunks), got:0};
     mpStatus(`Recibiendo la toma de ${escapeHtml(conn._name||'un jugador')}… 0%`);
@@ -1817,14 +1845,18 @@ function mpHostHandle(conn, msg){
     conn._rxSubmit = null;
     if(rx.chunks.some(c=>!c)){ mpStatus(`Se perdió parte de la toma de ${escapeHtml(conn._name||'un jugador')}. Pídele que la reenvíe (puede rehacer y confirmar de nuevo).`); return; }
     const fullBlob = new Blob(rx.chunks);
+    // si reenvía (reintento), se reemplaza su toma anterior en vez de duplicarla
+    if(conn._perfId) mpState.hostPool = mpState.hostPool.filter(p=>p.id!==conn._perfId);
     const perf = {id:uid(), clipId:mpState.clip.id, playerName: conn._name||rx.meta.name,
       fragments: rx.meta.fragMeta.map(fm=>({start:fm.start, end:fm.end, text:fm.text||'', leadTrim:fm.leadTrim||0, audioBlob: fullBlob.slice(fm.offset, fm.offset+fm.length, fm.mime||'audio/webm')})),
       createdAt:Date.now()};
     idbPut('performances', perf);
     mpState.hostPool.push(perf);
+    conn._perfId = perf.id;
     conn._submitted = true;
+    try{ conn.send({t:'submit-ack'}); }catch(e){}
     mpStatus('');
-    mpHostRenderWaiting();
+    if(mpState._waitingScreen) mpHostRenderWaiting();
   }
   else if(msg.t==='vote'){
     mpState.votes[conn.peer] = msg.forId;
@@ -1836,6 +1868,7 @@ function mpHostHandle(conn, msg){
 }
 
 function mpHostRenderWaiting(){
+  mpState._waitingScreen = true;
   const el = document.getElementById('mpBody');
   const total = mpState.conns.length + 1;
   const submitted = mpState.hostPool.length;
@@ -1889,20 +1922,46 @@ function mpJoinRoom(){
   const code = document.getElementById('mpJoinCode').value.trim().toUpperCase();
   const name = document.getElementById('mpJoinName').value.trim() || 'Jugador';
   if(!code){ mpStatus('Escribe el código de la sala.'); return; }
+  const btn = document.getElementById('mpBtnJoin');
+  if(btn){ if(btn.disabled) return; btn.disabled = true; }   // evita unirse varias veces con doble clic
+  // si ya había una conexión anterior de esta pestaña, se cierra: un navegador = un jugador
+  if(mpState && mpState.peer){ try{ mpState.peer.destroy(); }catch(e){} }
+  mpReconnectAttempts = 0;
   mpStatus('Conectando…');
   const peer = new Peer(undefined, {config: MP_ICE_CONFIG});
-  mpState = {role:'guest', peer, myName:name, clip:null, chatLog:[]};
+  mpState = {role:'guest', peer, myName:name, clip:null, chatLog:[], code, players:[], hostName:''};
+  const fail = msg=>{ mpStatus(msg); if(btn) btn.disabled = false; };
+  const joinTimeout = setTimeout(()=>{ if(mpState && !mpState._joined){ try{peer.destroy();}catch(e){} fail('No hubo respuesta de la sala. Revisa el código y que el anfitrión siga con la pestaña abierta.'); } }, 15000);
   peer.on('open', ()=>{
     const conn = peer.connect(roomId(code), {reliable:true});
     mpState.conn = conn;
     conn.on('open', ()=>{
+      mpState._joined = true; clearTimeout(joinTimeout);
       conn.send({t:'hello', name});
-      conn.on('data', msg=> mpGuestHandle(msg));
-      mpStatus('Conectado. Esperando a que el anfitrión elija la escena…');
+      conn.on('data', msg=>{ if(mpState && mpState.conn===conn) mpGuestHandle(msg); });
+      mpGuestRenderLobby();
     });
-    conn.on('close', ()=> mpGuestHandleDisconnect(code, name));
+    conn.on('close', ()=>{ if(mpState && mpState.conn===conn) mpGuestHandleDisconnect(code, name); });
   });
-  peer.on('error', e=> mpStatus('No se pudo conectar: '+(e.message||e.type)+'. Revisa el código.'));
+  peer.on('error', e=>{ clearTimeout(joinTimeout); fail('No se pudo conectar: '+(e.message||e.type)+'. Revisa el código.'); });
+}
+
+/* pantalla de sala para el invitado: ve el código, al anfitrión y a los demás jugadores */
+function mpGuestRenderLobby(){
+  if(!mpState || mpState.role!=='guest') return;
+  const el = document.getElementById('mpBody');
+  const players = mpState.players.length ? mpState.players : [mpState.myName];
+  el.innerHTML = `
+    <h2>Sala ${escapeHtml(mpState.code)}</h2>
+    <p class="hint">${mpState.hostName ? 'Anfitrión: <b>'+escapeHtml(mpState.hostName)+'</b>. ' : ''}Ya estás dentro. Cuando el anfitrión elija la escena, el clip se te enviará solo y empieza la partida.</p>
+    <h3 style="margin-top:18px; font-size:1.05rem;">Jugadores en la sala (${players.length})</h3>
+    <div id="mpParticipants">${players.map(n=>`<div class="participant-row"><span><span class="status-dot ok"></span>${escapeHtml(n)}${n===mpState.myName?' (tú)':''}</span></div>`).join('')}</div>
+    <div id="mpStatus" class="hint" style="margin-top:12px;">Esperando a que el anfitrión empiece…</div>
+    <div style="margin-top:14px;"><button class="btn btn-ghost" id="mpBtnLeaveGuest">Salir de la sala</button></div>
+    ${chatBoxHTML()}
+  `;
+  document.getElementById('mpBtnLeaveGuest').onclick = ()=>{ const pr=mpState.peer; mpState=null; try{pr.destroy();}catch(e){} mpShowChoice(); };
+  initChatBox();
 }
 
 let mpReconnectAttempts = 0;
@@ -1921,15 +1980,27 @@ function mpGuestHandleDisconnect(code, name){
     conn.on('open', ()=>{
       mpReconnectAttempts = 0;
       conn.send({t:'hello', name});
-      conn.on('data', msg=> mpGuestHandle(msg));
+      conn.on('data', msg=>{ if(mpState && mpState.conn===conn) mpGuestHandle(msg); });
       mpStatus('Reconectado.');
     });
-    conn.on('close', ()=> mpGuestHandleDisconnect(code, name));
+    conn.on('close', ()=>{ if(mpState && mpState.conn===conn) mpGuestHandleDisconnect(code, name); });
   }, 1500);
 }
 
 async function mpGuestHandle(msg){
-  if(msg.t==='music-meta'){
+  if(msg.t==='lobby'){
+    mpState.players = msg.players; mpState.hostName = msg.host;
+    if(!mpState._inGame) mpGuestRenderLobby();
+  }
+  else if(msg.t==='welcome'){ mpState.myName = msg.name; }
+  else if(msg.t==='locked'){
+    const pr = mpState.peer; mpState = null; try{pr.destroy();}catch(e){}
+    mpShowChoice(); mpStatus('Esa partida ya empezó; no se puede entrar a media ronda.');
+  }
+  else if(msg.t==='submit-ack'){
+    if(mpState._ackResolve){ mpState._ackResolve(); mpState._ackResolve = null; }
+  }
+  else if(msg.t==='music-meta'){
     mpState._rxMusic = {meta:msg, chunks:new Array(msg.totalChunks), got:0};
     mpStatus('Recibiendo la música… 0%');
   }
@@ -1964,6 +2035,9 @@ async function mpGuestHandle(msg){
     if(!rx) return;
     if(rx.chunks.some(c=>!c)){ mpStatus('Se perdieron partes del video. Pide al anfitrión que lo reenvíe.'); return; }
     const m = rx.meta;
+    if(mpState._roundClipId === m.clipId && mpState._inGame) return;   // clip duplicado: ya está jugando
+    mpState._roundClipId = m.clipId;
+    mpState._inGame = true;
     const clip = {id:m.clipId, name:m.name, videoBlob:new Blob(rx.chunks, {type:m.mime||'video/mp4'}),
                   duration:m.duration, fragments:m.fragments, createdAt:Date.now(),
                   music: mpState._music || null};
@@ -2084,7 +2158,14 @@ async function mpTrySendSubmit(perf){
     if(!mpState.conn || mpState.conn.open === false){
       throw new Error('la conexión con el anfitrión se cerró');
     }
+    const acked = new Promise((res,rej)=>{
+      mpState._ackResolve = res;
+      setTimeout(()=>rej(new Error('el anfitrión no confirmó que recibió tu toma')), 25000);
+    });
+    acked.catch(()=>{});
     await mpSendSubmit(perf);
+    mpStatus('Enviado. Esperando confirmación del anfitrión…');
+    await acked;
     done = true;
     clearInterval(timerInt); clearTimeout(stallTimer);
     const el = document.getElementById('mpBody');
